@@ -17,3 +17,15 @@ I think that “wise” amounts to “no current evidence of being unwise”. In
 
 However, we have just kicked the can down the road. Evidence of any trait (wise or unwise) needs to be coded for to be measured and unwise output is as complicated to code for as wise output, so we haven’t gained much on that front. What is surprising to me after this review of literature and ongoing work of my own is that we don’t have a general measure of wisdom, all of the measures are very specific to either a specific situation, or are self-reported.
 
+Some of the sources I read while exploring this idea:
+
+(AI and the transformation of social science research https://www.science.org/stoken/author-tokens/ST-1256/full) 
+
+https://uwaterloo.ca/wisdom-and-culture-lab/sites/default/files/uploads/files/grossmann_wisdom_techmanual.pdf
+
+https://link.springer.com/article/10.3758/s13428-024-02441-0 (preprint available https://osf.io/preprints/psyarxiv/x2f4a_v1) 
+
+Glück J, König S, Naschenweng K, Redzanowski U, Dorner L, Straßer I, Wiedermann W. How to measure wisdom: content, reliability, and validity of five measures. Front Psychol. 2013 Jul 12;4:405. doi: 10.3389/fpsyg.2013.00405. PMID: 23874310; PMCID: PMC3709094.
+
+Dong, M., Weststrate, N. M., & Fournier, M. A. (2022). Thirty Years of Psychological Wisdom Research: What We Know About the Correlates of an Ancient Concept. Perspectives on Psychological Science, 18(4), 778-811. https://doi.org/10.1177/17456916221114096 (Original work published 2023)
+
