@@ -11,4 +11,12 @@ My initial attempts at generating a protocol and doing this manually seemed prom
 
 This had subjectively good results, with more in-depth and useful answers. So I moved on to trying to measure the wisdom of the output. In https://github.com/monadsandtuples/wisecouncil/blob/main/notunwise.md I explore how we measure wisdom and come to the conclusion we have no good general measures for wisdom. This was disheartening, but I have gone on and made an attempt to automate the wise council anyway (https://github.com/monadsandtuples/wisecouncil/blob/main/wisecouncil.py) which can be used with google-adk, specifically https://github.com/google/adk-python
 
-It works sometimes, the failures seem to be mostly about the models sometimes outputting very strange structured data to then further process which halts the process. Work is ongoing on getting it fully generalized.
+This newest uploaded version works as follows
+
+1. Go to adk-python linked above and follow the instructions to install the adk
+2. Set your environment variable in .env
+3. Run adk web from the wisecouncil directory
+4. Select the council_agent and talk with it until you are satisfied (this is handled in agent.py)
+5. The report generation will happen in businessreportgenerator.py, this is usually about 30-40 calls to gemini
+
+This is set up with a very basic rate limiter so you can use it on the free tier.
