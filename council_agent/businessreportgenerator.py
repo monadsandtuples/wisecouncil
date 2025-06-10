@@ -1,5 +1,7 @@
 import logging
+import os
 import asyncio
+import inspect
 import json
 import re # For parsing and sanitizing
 from typing import AsyncGenerator, List, Dict, Optional, Any
@@ -16,15 +18,19 @@ from google.genai import types as genai_types
 from google.adk.models import LlmResponse
 import google.genai as genai
 from google.adk.agents.callback_context import CallbackContext
+
+from .output_schemas import OutlineExpertOutput, ConsistencyCheckOutput, SectionQualityOutput
             
 
 # --- Configuration ---
-APP_NAME = "Business Report Generator"
-USER_ID = "default_user"
+APP_NAME = os.environ.get("REPORT_APP_NAME", "Business Report Generator")
+USER_ID = os.environ.get("REPORT_USER_ID", "other_agents")
 SESSION_ID_COUNTER = 0
-GEMINI_MODEL = "gemini-1.5-flash-latest"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-latest")
 
 RATE_LIMIT_DELAY=3
+MAX_CONSISTENCY_REVISIONS = 5
+MAX_SECTION_REVISIONS = 2
 
 logging.basicConfig(
     filename="wisecouncilrun.log",
@@ -43,17 +49,19 @@ LLM_INSTRUCTIONS = {
     "OUTLINE_EXPERT_GENERATOR": """You are a business strategy consultant.
 Given a business idea summary in session state ['input_summary'], your tasks are:
 1.  Create a compelling title for the report.
-2.  Generate a clear report outline with exactly 6 section titles. These sections should cover typical aspects of a business plan or investment opportunity analysis (e.g., 'Market Analysis', 'Product/Service Offering', 'Financial Projections', 'Management Team', 'Risk Assessment & Mitigation') Do not include an Executive Summary.
-3.  For each of the 6 outline sections, create a short bio (1-2 sentences) for a hypothetical expert who would write that section and define their role. Assign each expert to one specific section title.
+2.  Generate a clear report outline with exactly 6 section titles. These sections should cover typical aspects of a business plan or investment opportunity analysis (e.g., 'Market Analysis', 'Product/Service Offering', 'Financial Projections', 'Management Team', 'Risk Assessment & Mitigation', 'Operational Analysis', 'Competitive Landscape', 'Implementation Strategy').
+3.  For each of the 6 outline sections, create a short prompt outlining the expertise needed for a hypothetical expert to write that section.
+
+IMPORTANT: Do NOT include "Executive Summary", "Introduction", "Conclusion", or "Summary" as section titles. These will be handled separately. Focus on analytical and substantive content sections only.
 
 Output your response as a single JSON object with the following structure:
 {
   "report_title": "Your Report Title",
   "outline_sections": ["Section 1 Title", "Section 2 Title", ..., "Section 6 Title"],
   "experts": [
-    {"role": "Expert 1 Role", "bio": "Expert 1 Bio...", "assigned_section_title": "Section 1 Title"},
+    {"prompt": "Expert 1 prompt", "assigned_section_title": "Section 1 Title"},
     ...
-    {"role": "Expert 6 Role", "bio": "Expert 6 Bio...", "assigned_section_title": "Section 6 Title"}
+    {"prompt": "Expert 6 prompt", "assigned_section_title": "Section 6 Title"},
   ]
 }
 Ensure the JSON is valid and all fields are populated correctly. There must be exactly 6 sections and 6 experts, with each expert assigned to one unique section.
@@ -66,41 +74,40 @@ Review the entire draft report for:
 3.  Redundancy: Is there unnecessary repetition of information across sections?
 4.  Math: Are any numerical values incorrect? Are all the numerators and denominators consistent and correct ie has a daily value become a weekly value or similar?
 
-Output your findings in the following exact format:
-Consistent: [True/False]
----
-(If False, list issues below, each block separated by '---')
-Issue 1:
-Section: [Relevant Section Title from the input, or 'Overall Report' if general]
-Description: [Detailed description of the inconsistency]
----
-Issue 2:
-Section: [Relevant Section Title]
-Description: [Detailed description of the inconsistency]
----
-(etc.)
-If Consistent is True, do not add any Issue blocks.
+Output your findings as a JSON object with the following structure:
+{
+  "consistent": true/false,
+  "issues": [
+    {
+      "section": "Section Title or 'Overall Report'",
+      "description": "Detailed description of the inconsistency"
+    }
+  ]
+}
+If consistent is true, the issues array should be empty or null.
 """,
     "FINAL_REVIEWER": """You are a final proofreader and editor.
 The almost-final business report is in session state ['report_for_final_review'].
 The full report title is in session state ['report_title'].
-The expert profiles are in session state ['expert_profiles'] (a list of dictionaries, each with 'role', 'bio').
+The expert profiles are in session state ['expert_profiles'] (a list of dictionaries with prompts).
 The report sections are in session state ['report_sections_content'] (a dictionary of section_title: content).
 
 Your task is to:
 1. Start the report with the main title (from ['report_title']) as a level 1 markdown heading (e.g., "# Report Title").
-2. For each section in ['report_sections_content'], present its content under its respective title as a level 2 markdown heading (e.g., "## Section Title From Outline"). Use the section titles from ['outline_sections'] as the source for these headings and to determine the order.
-3. Perform a light polish on the language for clarity, conciseness, and professionalism. Ensure a consistent tone.
+2. If "Executive Summary" exists in ['report_sections_content'], place it first as "## Executive Summary".
+3. For the remaining sections in ['report_sections_content'], present their content under their respective titles as level 2 markdown headings (e.g., "## Section Title"). Use the section titles from ['outline_sections'] to determine the order of the main analytical sections (excluding Executive Summary).
+4. Perform a light polish on the language for clarity, conciseness, and professionalism. Ensure a consistent tone.
 Do not add new content or change the core meaning. Output only the final, polished report text.
 """,
-    "EXPERT_SECTION_WRITER_TEMPLATE": """You are {expert_role}. Your bio is: "{expert_bio}".
+    "EXPERT_SECTION_WRITER_TEMPLATE": """{expert_prompt}
 Your task is to write the '{section_title}' section of a business report.
 The overall business idea/summary is in session state ['input_summary'].
 The full report outline is in session state ['outline_sections'].
 Focus ONLY on the '{section_title}' section.
-Write a comprehensive two to four paragraphs (approx 500-1000 words) for this section. Include any relevant analytical tools that someone in your profession would use for this scenario.
+Write a comprehensive two to four paragraphs (approx 500-1000 words) for this section. Include any relevant analytical tools that would be appropriate for this scenario.
 If session state ['current_section_critique'] contains feedback (and is not 'Initial draft needed.'), address it in your revision.
-Output ONLY the content for the '{section_title}' section. Do not make up any information not provided, instead make a note that more information is required to fully explore the idea. Do not include any [Insert Information Here] style tags.
+
+IMPORTANT: Output ONLY the raw text content for the '{section_title}' section. Do not include any markdown formatting, code blocks, or conversational responses. Do not include section headers or titles. Start directly with the content. Do not make up any information not provided, instead make a note that more information is required to fully explore the idea. Do not include any [Insert Information Here] style tags.
 Current draft (if any, for revision) is in session state ['current_section_content'].
 """,
     "SECTION_QUALITY_CHECKER_TEMPLATE": """You are a quality assurance editor.
@@ -108,19 +115,36 @@ Review the content provided in session state ['current_section_content'] for the
 The overall business idea is in session state ['input_summary'].
 Is the section content reasonable, well-written, on-topic for '{section_title}', and sufficiently detailed (around 500-1000 words)?
 The section content strictly must not contain any [Add details here] like [Add Revenue number] or [Add source].
-Output your findings in the following format:
-Status: [reasonable/needs_revision]
-Critique: [If needs_revision, provide brief, actionable feedback here. If reasonable, write 'None'.]
----
-End of Assessment ---
+Output your findings as a JSON object with the following structure:
+{{
+  "status": "reasonable" or "needs_revision",
+  "critique": "Brief, actionable feedback if revision needed, or null if reasonable"
+}}
 """,
-    "EXPERT_SECTION_REVISER_TEMPLATE": """You are {expert_role}. Your bio is: "{expert_bio}".
+    "EXPERT_SECTION_REVISER_TEMPLATE": """{expert_prompt}
 You are revising the '{section_title}' section of a business report based on feedback.
 The overall business idea/summary is in session state ['input_summary'].
 The current draft of your section is in session state ['current_section_content'].
 The feedback for revision is in session state ['current_section_critique'].
 Address the feedback and provide the revised content for ONLY the '{section_title}' section.
-Output ONLY the revised content for the section.
+
+IMPORTANT: Output ONLY the raw text content for the revised '{section_title}' section. Do not include any markdown formatting, code blocks, or conversational responses. Do not include section headers or titles. Start directly with the revised content.
+""",
+    "EXECUTIVE_SUMMARY_GENERATOR": """You are a senior business analyst tasked with creating an executive summary.
+The complete business report content is provided in session state ['final_report_content']. This contains all the analytical sections that have been written and reviewed.
+The original business idea/summary is in session state ['input_summary'].
+The report title is in session state ['report_title'].
+
+Your task is to create a comprehensive executive summary (2-3 paragraphs, approximately 100-500 words) that:
+1. Briefly describes the business opportunity or situation being analyzed
+2. Summarizes the key findings from each section of the completed report
+3. Provides a clear, actionable recommendation based on the analysis
+4. Highlights the most critical risks and opportunities identified
+5. States the expected return on investment or key financial metrics if applicable
+
+IMPORTANT: Base your summary ONLY on the content that has been written in the report sections. Do not add new analysis or speculation. This should be a true summary of the completed analysis, not a preview of what might be analyzed.
+
+Output ONLY the raw text content for the executive summary. Do not include any markdown formatting, code blocks, conversational responses, or section headers. Start directly with the summary content.
 """
 }
 
@@ -160,6 +184,7 @@ class StopLoopIfConditionMetAgent(BaseAgent):
 class BusinessReportOrchestratorAgent(BaseAgent):
     outline_expert_generator: LlmAgent
     report_consistency_checker: LlmAgent
+    executive_summary_generator: LlmAgent
     final_reviewer: LlmAgent
 
     model_config = {"arbitrary_types_allowed": True} 
@@ -169,6 +194,7 @@ class BusinessReportOrchestratorAgent(BaseAgent):
         name: str,
         outline_expert_generator: LlmAgent,
         report_consistency_checker: LlmAgent,
+        executive_summary_generator: LlmAgent,
         final_reviewer: LlmAgent,
         before_agent_callback: Any = None,
     ):
@@ -176,16 +202,19 @@ class BusinessReportOrchestratorAgent(BaseAgent):
             name=name,
             outline_expert_generator=outline_expert_generator,
             report_consistency_checker=report_consistency_checker,
+            executive_summary_generator=executive_summary_generator,
             final_reviewer=final_reviewer,
             sub_agents=[
                 outline_expert_generator,
                 report_consistency_checker,
+                executive_summary_generator,
                 final_reviewer,
             ],
             before_agent_callback=before_agent_callback,
         )
         self.outline_expert_generator = outline_expert_generator
         self.report_consistency_checker = report_consistency_checker
+        self.executive_summary_generator = executive_summary_generator
         self.final_reviewer = final_reviewer
 
     @override
@@ -193,6 +222,8 @@ class BusinessReportOrchestratorAgent(BaseAgent):
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
         logger.info(f"[{self.name}] Starting Business Report Generation Workflow.")
+        if inspect.iscoroutine(ctx.session):
+            ctx.session = await ctx.session
        
         logger.info(f"[{self.name}] Running OutlineAndExpertGeneratorAgent...")
         yield Event(author=self.name, actions=EventActions(state_delta={"generated_report_structure_text": None})) # For callback
@@ -216,7 +247,6 @@ class BusinessReportOrchestratorAgent(BaseAgent):
         logger.info(f"[{self.name}] Expert Profiles: {json.dumps(expert_profiles, indent=2)}")
 
         # 2. Dynamically Invoke Agents for Each Section with Refinement Loop
-        MAX_SECTION_REVISIONS = 2
         for i, section_title_from_outline in enumerate(outline_sections):
             # Find the expert assigned to this section title (case-insensitive match for robustness)
             current_expert_profile = next(
@@ -230,26 +260,22 @@ class BusinessReportOrchestratorAgent(BaseAgent):
                 continue
             
             actual_section_title = current_expert_profile.get("assigned_section_title", section_title_from_outline) # Use title from expert profile if available
-            expert_role = current_expert_profile.get("role", "Expert")
-            expert_bio = current_expert_profile.get("bio", "N/A")
+            expert_prompt = current_expert_profile.get("prompt", "You are an expert analyst.")
 
-
-            logger.info(f"[{self.name}] Starting section: '{actual_section_title}' by {expert_role}")
+            logger.info(f"[{self.name}] Starting section: '{actual_section_title}' with prompt: {expert_prompt[:50]}...")
             yield Event(author=self.name, content=genai_types.Content(parts=[genai_types.Part(text=f"Writing section: {actual_section_title}...")]))
 
             ctx.session.state["current_section_title_being_written"] = actual_section_title
-            ctx.session.state["current_expert_role"] = expert_role
-            ctx.session.state["current_expert_bio"] = expert_bio
+            ctx.session.state["current_expert_prompt"] = expert_prompt
             ctx.session.state["current_section_content"] = ""
             ctx.session.state["current_section_quality_status"] = "needs_revision"
             ctx.session.state["current_section_critique"] = "Initial draft needed."
 
             expert_section_writer = LlmAgent(
-                name=f"ExpertSectionWriter_{_sanitize_for_agent_name(expert_role)}",
+                name=f"ExpertSectionWriter_{_sanitize_for_agent_name(actual_section_title)}",
                 model=GEMINI_MODEL,
                 instruction=LLM_INSTRUCTIONS["EXPERT_SECTION_WRITER_TEMPLATE"].format(
-                    expert_role=expert_role,
-                    expert_bio=expert_bio,
+                    expert_prompt=expert_prompt,
                     section_title=actual_section_title
                 ),
                 output_key="current_section_content",
@@ -263,6 +289,7 @@ class BusinessReportOrchestratorAgent(BaseAgent):
                     section_title=actual_section_title
                 ),
                 output_key="raw_section_quality_assessment", 
+                output_schema=SectionQualityOutput,
                 before_agent_callback=delay
             )
             
@@ -279,21 +306,34 @@ class BusinessReportOrchestratorAgent(BaseAgent):
                     callback_context.state["current_section_critique"] = "Quality checker response was empty."
                     return
 
-                status_match = re.search(r"Status:\s*(reasonable|needs_revision)", text_output, re.IGNORECASE)
-                critique_match = re.search(r"Critique:\s*(.*?)(\n---|\Z)", text_output, re.DOTALL | re.IGNORECASE)
+                # --- Start: Stripping Logic for JSON ---
+                cleaned_json_string = text_output.strip()
 
-                if status_match:
-                    callback_context.state["current_section_quality_status"] = status_match.group(1).lower()
-                    if critique_match:
-                        critique_text = critique_match.group(1).strip()
-                        callback_context.state["current_section_critique"] = critique_text if critique_text.lower() != "none" else ""
-                    else:
-                        callback_context.state["current_section_critique"] = "Critique not found in response."
+                if cleaned_json_string.startswith("```json"):
+                    cleaned_json_string = cleaned_json_string.removeprefix("```json")
+                elif cleaned_json_string.startswith("```"):
+                    cleaned_json_string = cleaned_json_string.removeprefix("```")
+
+                if cleaned_json_string.endswith("```"):
+                    cleaned_json_string = cleaned_json_string.removesuffix("```")
+
+                cleaned_json_string = cleaned_json_string.strip()
+                # --- End: Stripping Logic ---
+
+                try:
+                    data = json.loads(cleaned_json_string)
+                    callback_context.state["current_section_quality_status"] = data.get("status", "needs_revision")
+                    critique = data.get("critique")
+                    callback_context.state["current_section_critique"] = critique if critique and critique.lower() != "none" else ""
                     logger.info(f"Quality Check for '{callback_context.state['current_section_title_being_written']}': {callback_context.state['current_section_quality_status']}, Critique: {callback_context.state['current_section_critique']}")
-                else:
-                    logger.error(f"Could not parse status from quality checker response: {text_output}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON from quality checker: {e}. Cleaned string (first 500 chars):\n{cleaned_json_string[:500]}...")
                     callback_context.state["current_section_quality_status"] = "needs_revision"
-                    callback_context.state["current_section_critique"] = "Error parsing quality check status."
+                    callback_context.state["current_section_critique"] = "Error parsing quality check JSON response."
+                except Exception as e:
+                    logger.error(f"Failed to process quality check data: {e}")
+                    callback_context.state["current_section_quality_status"] = "needs_revision"
+                    callback_context.state["current_section_critique"] = "Error processing quality check response."
 
             section_quality_checker.after_model_callback = parse_quality_result_callback
 
@@ -326,7 +366,7 @@ class BusinessReportOrchestratorAgent(BaseAgent):
         ctx.session.state["draft_report_for_consistency"] = draft_report_for_consistency
         logger.info(f"[{self.name}] Draft report compiled for consistency check. Length: {len(draft_report_for_consistency)}")
 
-        MAX_CONSISTENCY_REVISIONS = 5
+        
         for attempt in range(MAX_CONSISTENCY_REVISIONS):
             logger.info(f"[{self.name}] Running ReportConsistencyCheckerAgent (Attempt {attempt + 1})...")
             # yield Event(author=self.name, content=genai_types.Content(parts=[genai_types.Part(text="Checking report consistency...")]))
@@ -359,8 +399,8 @@ class BusinessReportOrchestratorAgent(BaseAgent):
                                 continue
                             
                             ctx.session.state["current_section_title_being_written"] = issue_section_title
-                            ctx.session.state["current_expert_role"] = expert_profile_for_revision.get("role", "Expert")
-                            ctx.session.state["current_expert_bio"] = expert_profile_for_revision.get("bio", "N/A")
+                            expert_prompt_for_revision = expert_profile_for_revision.get("prompt", "You are an expert analyst.")
+                            ctx.session.state["current_expert_prompt"] = expert_prompt_for_revision
                             ctx.session.state["current_section_content"] = ctx.session.state["report_sections_content"][issue_section_title]
                             ctx.session.state["current_section_critique"] = (
                                 f"CONSISTENCY FEEDBACK for section '{issue_section_title}': {issue_description}. "
@@ -368,11 +408,10 @@ class BusinessReportOrchestratorAgent(BaseAgent):
                             )
                             
                             reviser_agent = LlmAgent(
-                                name=f"ExpertSectionReviser_{_sanitize_for_agent_name(expert_profile_for_revision.get('role', 'Expert'))}",
+                                name=f"ExpertSectionReviser_{_sanitize_for_agent_name(issue_section_title)}",
                                 model=GEMINI_MODEL,
                                 instruction=LLM_INSTRUCTIONS["EXPERT_SECTION_REVISER_TEMPLATE"].format(
-                                    expert_role=expert_profile_for_revision.get('role', 'Expert'),
-                                    expert_bio=expert_profile_for_revision.get('bio', 'N/A'),
+                                    expert_prompt=expert_prompt_for_revision,
                                     section_title=issue_section_title
                                 ),
                                 output_key="current_section_content",
@@ -399,6 +438,17 @@ class BusinessReportOrchestratorAgent(BaseAgent):
             logger.warning(f"[{self.name}] Report may still have inconsistencies after {MAX_CONSISTENCY_REVISIONS} attempts.")
             ctx.session.state["final_report_content"] = draft_report_for_consistency
 
+        # NEW: Generate Executive Summary based on completed content
+        logger.info(f"[{self.name}] Running ExecutiveSummaryGeneratorAgent...")
+        yield Event(author=self.name, content=genai_types.Content(parts=[genai_types.Part(text="Generating executive summary based on completed analysis...")]))
+        async for event in self.executive_summary_generator.run_async(ctx):
+            yield event
+        
+        executive_summary = ctx.session.state.get("executive_summary_content", "Error: Executive summary not generated.")
+        logger.info(f"[{self.name}] Executive summary generated. Length: {len(executive_summary)}")
+        
+        # Add executive summary to the report sections content (it will be placed first by final reviewer)
+        ctx.session.state["report_sections_content"]["Executive Summary"] = executive_summary
 
         logger.info(f"[{self.name}] Running FinalReviewerAgent...")
         # yield Event(author=self.name, content=genai_types.Content(parts=[genai_types.Part(text="Performing final review...")]))
@@ -469,7 +519,7 @@ def parse_report_structure_callback(callback_context: CallbackContext, llm_respo
                 isinstance(callback_context.state["expert_profiles"], list) and
                 len(callback_context.state["expert_profiles"]) == 6 and
                 all(isinstance(s, str) for s in callback_context.state["outline_sections"]) and
-                all(isinstance(e, dict) and "role" in e and "bio" in e and "assigned_section_title" in e
+                all(isinstance(e, dict) and "prompt" in e and "assigned_section_title" in e
                     for e in callback_context.state["expert_profiles"])):
             raise ValueError("Parsed structure does not match expected format or count.")
         logger.info("Successfully parsed report structure from OutlineAndExpertGeneratorAgent.")
@@ -495,37 +545,49 @@ def parse_consistency_result_callback(callback_context: CallbackContext, llm_res
         callback_context.state["consistency_issues"] = []
         return
 
-    is_consistent_match = re.search(r"Consistent:\s*(true|false)", text_output, re.IGNORECASE)
-    if is_consistent_match:
-        callback_context.state["is_consistent"] = is_consistent_match.group(1).lower() == 'true'
-    else:
-        logger.error(f"Could not parse consistency status from: {text_output}")
-        callback_context.state["is_consistent"] = True # Default
+    # --- Start: Stripping Logic for JSON ---
+    cleaned_json_string = text_output.strip()
+
+    if cleaned_json_string.startswith("```json"):
+        cleaned_json_string = cleaned_json_string.removeprefix("```json")
+    elif cleaned_json_string.startswith("```"):
+        cleaned_json_string = cleaned_json_string.removeprefix("```")
+
+    if cleaned_json_string.endswith("```"):
+        cleaned_json_string = cleaned_json_string.removesuffix("```")
+
+    cleaned_json_string = cleaned_json_string.strip()
+    # --- End: Stripping Logic ---
+
+    try:
+        data = json.loads(cleaned_json_string)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from consistency checker: {e}. Cleaned string (first 500 chars):\n{cleaned_json_string[:500]}...")
+        callback_context.state["is_consistent"] = True # Default to consistent
         callback_context.state["consistency_issues"] = []
         return
 
-    issues = []
-    if not callback_context.state["is_consistent"]: 
-        issue_blocks = text_output.split("---")[1:]
-        for block in issue_blocks:
-            if not block.strip(): continue # type: ignore
-            section_match = re.search(r"Section:\s*(.*?)\n", block, re.IGNORECASE)
-            description_match = re.search(r"Description:\s*(.*?)(?:\nIssue|\Z)", block, re.DOTALL | re.IGNORECASE) # Stop at next Issue or end
-            
-            if section_match and description_match:
-                issues.append({
-                    "section_title": section_match.group(1).strip(),
-                    "description": description_match.group(1).strip()
-                })
-            elif description_match:
-                 issues.append({
-                    "section_title": "Overall Report",
-                    "description": description_match.group(1).strip()
-                })
+    try:
+        callback_context.state["is_consistent"] = data.get("consistent", True)
+        raw_issues = data.get("issues", [])
+        
+        # Convert issues to the expected format
+        issues = []
+        if raw_issues:
+            for issue in raw_issues:
+                if isinstance(issue, dict) and "section" in issue and "description" in issue:
+                    issues.append({
+                        "section_title": issue["section"],
+                        "description": issue["description"]
+                    })
 
+        callback_context.state["consistency_issues"] = issues
+        logger.info(f"Parsed Consistency Check: Consistent={callback_context.state['is_consistent']}, Issues: {len(issues)}")
 
-    callback_context.state["consistency_issues"] = issues
-    logger.info(f"Parsed Consistency Check: Consistent={callback_context.state['is_consistent']}, Issues: {len(issues)}")
+    except Exception as e:
+        logger.error(f"Failed to process consistency check data: {e}. Raw data: {data}")
+        callback_context.state["is_consistent"] = True
+        callback_context.state["consistency_issues"] = []
 
 
 outline_expert_generator = LlmAgent(
@@ -533,6 +595,7 @@ outline_expert_generator = LlmAgent(
     model=GEMINI_MODEL,
     instruction=LLM_INSTRUCTIONS["OUTLINE_EXPERT_GENERATOR"],
     output_key="generated_report_structure_text", 
+    output_schema=OutlineExpertOutput,
     before_agent_callback=delay,
     after_model_callback=parse_report_structure_callback
 )
@@ -542,7 +605,16 @@ report_consistency_checker = LlmAgent(
     model=GEMINI_MODEL,
     instruction=LLM_INSTRUCTIONS["REPORT_CONSISTENCY_CHECKER"],
     output_key="raw_consistency_check_output", # Raw text output
+    output_schema=ConsistencyCheckOutput,
     after_model_callback=parse_consistency_result_callback,
+    before_agent_callback=delay
+)
+
+executive_summary_generator = LlmAgent(
+    name="ExecutiveSummaryGeneratorAgent",
+    model=GEMINI_MODEL,
+    instruction=LLM_INSTRUCTIONS["EXECUTIVE_SUMMARY_GENERATOR"],
+    output_key="executive_summary_content",
     before_agent_callback=delay
 )
 
@@ -559,6 +631,7 @@ report_orchestrator = BusinessReportOrchestratorAgent(
     name="BusinessReportOrchestrator",
     outline_expert_generator=outline_expert_generator,
     report_consistency_checker=report_consistency_checker,
+    executive_summary_generator=executive_summary_generator,
     final_reviewer=final_reviewer,
     before_agent_callback=delay
 )
@@ -573,7 +646,7 @@ async def generate_report(business_summary: str) -> str:
     current_session_id = f"report_session_{SESSION_ID_COUNTER}"
 
     initial_state = {"input_summary": business_summary}
-    session = session_service.create_session(
+    session = await session_service.create_session(
         app_name=APP_NAME,
         user_id=USER_ID,
         session_id=current_session_id,
@@ -596,7 +669,7 @@ async def generate_report(business_summary: str) -> str:
             final_report_text = event.content.parts[0].text
             logger.info(f"[{current_session_id}] Final Report Event from [{event.author}]:\n{final_report_text[:500]}...")
 
-    final_session = session_service.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=current_session_id)
+    final_session = await session_service.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=current_session_id)
     if final_session:
         logger.info(f"[{current_session_id}] --- Final Session State (Brief) ---")
         outline_sections_val = final_session.state.get("outline_sections")
@@ -613,37 +686,3 @@ async def generate_report(business_summary: str) -> str:
         logger.info(json.dumps(brief_state, indent=2))
 
     return final_report_text
-
-# --- Main Execution ---
-async def main():
-    business_idea_1 = """
-    We plan to launch 'EcoSuds', a subscription service for eco-friendly, zero-waste cleaning products.
-    Customers receive a monthly box with concentrated refills for reusable bottles, significantly reducing plastic waste.
-    Target audience: environmentally conscious millennials and Gen Z.
-    Key differentiators: customizable boxes, carbon-neutral delivery, and a return program for refill pouches.
-    Revenue model: tiered monthly subscriptions and add-on purchases of sustainable home goods.
-    Initial funding needed for product development, branding, and setting up logistics.
-    """
-    print("\n--- Generating Report for EcoSuds ---")
-    report1 = await generate_report(business_idea_1)
-    print("\n\n======= FINAL REPORT (EcoSuds) =======\n")
-    print(report1)
-    print("\n===================================================\n\n")
-
-    business_idea_2 = """
-    'AI Tutor Pro' - An adaptive learning platform for K-12 mathematics.
-    Utilizes AI to personalize learning paths, identify student weaknesses, and provide targeted exercises and explanations.
-    Offers gamified learning modules and real-time progress tracking for students, parents, and teachers.
-    Monetization through school district licenses and premium individual subscriptions.
-    Competitive advantage: more sophisticated AI than existing platforms, and curriculum alignment with national standards.
-    Seeking seed investment for scaling server infrastructure and expanding content to other subjects.
-    """
-    print("\n--- Generating Report for AI Tutor Pro ---")
-    report2 = await generate_report(business_idea_2)
-    print("\n\n======= FINAL REPORT (AI Tutor Pro =======\n")
-    print(report2)
-    print("\n======================================================\n\n")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

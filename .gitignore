@@ -1,0 +1,3 @@
+.venv/
+council_agent/__pycache__/
+wisecouncilrun.log
