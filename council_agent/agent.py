@@ -67,10 +67,10 @@ class ReportGeneratorCallerAgent(BaseAgent):
                 })
             )
             
-            # Transfer back to the root agent to present the report
+            # Transfer back to the root agent with the report content
             yield Event(
                 author=self.name,
-                content=genai_types.Content(parts=[genai_types.Part(text="Report generation completed. Transferring back to main advisor.")]),
+                content=genai_types.Content(parts=[genai_types.Part(text=f"Here is your completed business analysis report:\n\n{final_report_text}\n\nLet me know if you have any questions about the analysis or recommendations, or if you'd like to generate a new report with different parameters.")]),
                 actions=EventActions(transfer_to_agent="council_liason"),
                 turn_complete=True
             )
