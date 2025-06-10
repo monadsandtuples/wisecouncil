@@ -56,10 +56,22 @@ class ReportGeneratorCallerAgent(BaseAgent):
         
         try:
             final_report_text = await generate_report(str(situation_summary))
-            logger.info(f"[{self.name}] Report generation complete. Yielding final report.")
+            logger.info(f"[{self.name}] Report generation complete. Storing report and transferring back to root agent.")
+            
+            # Store the completed report in session state
             yield Event(
                 author=self.name,
-                content=genai_types.Content(parts=[genai_types.Part(text=final_report_text)]),
+                actions=EventActions(state_delta={
+                    "completed_report": final_report_text,
+                    "report_completed": True
+                })
+            )
+            
+            # Transfer back to the root agent to present the report
+            yield Event(
+                author=self.name,
+                content=genai_types.Content(parts=[genai_types.Part(text="Report generation completed. Transferring back to main advisor.")]),
+                actions=EventActions(transfer_to_agent="council_liason"),
                 turn_complete=True
             )
         except Exception as e:
@@ -73,22 +85,9 @@ class ReportGeneratorCallerAgent(BaseAgent):
 
 
 
-final_agent = LlmAgent(
-    name="council_liason_final",
-    model=GEMINI_MODEL,
-    description=(
-        "Agent to ensure the user is satisfies with their report."
-    ),
-    instruction=(
-        "Ensure the user is satisfied with their report, and if not, gather more information"
-    ),
-    output_key="final output",   
-    sub_agents=[],
-)
-
 waiting_room = SequentialAgent(
     name="waiting_room",
-    sub_agents=[ReportGeneratorCallerAgent(name="WiseCouncilReportGenerator"), final_agent],
+    sub_agents=[ReportGeneratorCallerAgent(name="WiseCouncilReportGenerator")],
 )
 
 
@@ -110,10 +109,16 @@ root_agent = LlmAgent(
     name="council_liason",
     model=GEMINI_MODEL,
     description=(
-        "Agent to establish the base facts of a situation that a person is asking for advice about."
+        "Agent to establish the base facts of a situation that a person is asking for advice about, and to present completed reports."
     ),
     instruction=(
-        "You are the liason for a large network of agents who are all specialists or generalists and wise advisors, your goal is to understand the persons situation and their context. You will ask specific questions until you have a good understanding of the situation. Your job is not to give any advice, only to gain an understanding of the situation. You will ask if there is anything else after you have run out of specific questions. Once the user has no more questions then transfer the user to a council_liason_summary agent"
+        "You are the liason for a large network of agents who are all specialists or generalists and wise advisors. You have two main responsibilities:\n\n"
+        "1. INITIAL CONSULTATION: If session state does not contain 'report_completed' or it's false, your goal is to understand the person's situation and context. Ask specific questions until you have a good understanding of the situation. Your job is not to give any advice, only to gain an understanding of the situation. Ask if there is anything else after you have run out of specific questions. Once the user has no more questions, transfer the user to a council_liason_summary agent.\n\n"
+        "2. POST-REPORT PRESENTATION: If session state contains 'report_completed' as true and 'completed_report', present the completed business analysis report to the user. Say something like 'Here is your completed business analysis report:' followed by the report content from session state. Then offer to help with:\n"
+        "- Answer questions about the analysis or recommendations\n"
+        "- Generate a new report with different parameters (transfer to council_liason_summary)\n"
+        "- Start a completely new analysis (clear the session state and restart)\n\n"
+        "Always check session state first to determine which mode you should be in."
     ),
     output_key="intake_data",
     sub_agents=[summary_agent],
